@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 import random
 from typing import Any, List, Optional, Dict
@@ -28,7 +29,7 @@ from langchain_core.language_models import BaseChatModel, SimpleChatModel
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk, BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph, MessagesState
-0
+
 from typing import TypedDict, Annotated, List, Union
 from langchain_core.agents import AgentAction, AgentFinish
 import operator
@@ -37,15 +38,19 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from langchain_core.messages import ToolCall, ToolMessage
 
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
+os.environ['HF_HOME'] = '/data/placido/cache/'
 device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
+
 
 # Define tools
 @tool
 def get_files_list() -> List[str]:
     """Tool to list all files in the directory."""
     try:
-        return os.listdir("/data/placido/MA-LMM/AGI")
+        return os.listdir("/data/placido/AGI/")
     except Exception as e:
         return [f"Error accessing directory: {str(e)}"]
 
@@ -53,7 +58,7 @@ def get_files_list() -> List[str]:
 def get_file_content(file: str) -> str:
     """Tool to get the content of a specific file specified in the argument."""
     try:
-        with open(f"/data/placido/MA-LMM/AGI/{file}", "r") as f:
+        with open(f"/data/placido/AGI/{file}", "r") as f:
             return f.read()
     except FileNotFoundError:
         return f"File {file} not found."
@@ -61,10 +66,11 @@ def get_file_content(file: str) -> str:
         return f"Error reading file {file}: {str(e)}"
 
 @tool
-def final_answer(
+def tell_user(
     text: str,
 ):
     """Returns a natural language response to the user in the form of a string."""
+    print(text)
     return text
 
 @tool
@@ -75,7 +81,7 @@ def end_interaction() -> None:
 tools=[
     get_files_list,
     get_file_content,
-    final_answer,
+    tell_user,
     end_interaction
 ]
 
@@ -86,7 +92,7 @@ tools=[
 
 class AgentState(TypedDict):
     input: str
-    chat_history: list[BaseMessage]
+    chat_history: Annotated[list[tuple[BaseMessage, str]], operator.add]
     intermediate_steps: Annotated[list[tuple[AgentAction, str]], operator.add]
 
 # Define a model for tool call parameters
@@ -98,7 +104,7 @@ class ToolCall(BaseModel):
 
 # Tool choice model with dynamic listing of available tools
 class AIAnswer(BaseModel):
-    # content: str = Field(description="Content of the message. This should specify next steps.")
+    # content: str = Field(description="Content of the message. This should specify next steps.")
     tool_calls: ToolCall = Field(
         description="Tool call to be invoked. Only one tool call is allowed.",
         title="Tool Call",
@@ -115,7 +121,7 @@ class AIAnswer(BaseModel):
 # QwenLLM class with tool binding and invocation
 class QwenLLM(BaseChatModel):
     model: Any
-    processor: Any
+    tokenizer: Any
     tools: Dict[str, callable] = {}
     output_parser: Optional[JsonOutputParser] = None  # Add output_parser attribute
 
@@ -127,43 +133,46 @@ class QwenLLM(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         """Handles LLM inference with video and text inputs."""
-        print(f"\n++++++\n{messages}\n++++++\n")
+        print(f"\n*******\n{messages}\n*******\n")
 
-        formatted_messages = [{"role": "user", "content": [{"type": "text", "text": msg.content}] } for msg in messages]
-        messages = formatted_messages
-
-        # Prepare for inference
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(device)
-
-        # Model inference
-        generated_ids = self.model.generate(**inputs, max_new_tokens=1024)
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        messages = [
+            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+            {"role": "user", "content": messages[0].content}
         ]
-        output_text = self.processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
         )
+        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=1024
+        )
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+
+        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        print(f"\n-------\n{response}\n-------\n")
 
         # Parse the output if an output parser is set
-        print(f"\n-------\n{output_text}\n-------\n")
         if self.output_parser:
-            parsed_output = self.output_parser.parse(output_text[0])
-            print(f"\n-------\n{parsed_output}\n-------\n")
-            tool_calls = parsed_output["tool_calls"]
-            ai_message = AIMessage(content="", tool_calls=tool_calls)
+            try:
+                #if there is the "json" string in the response, we need to remove it
+                pattern = r'^```json\s*(.*?)\s*```$'
+                cleaned_string = re.sub(pattern, r'\1', response, flags=re.DOTALL)
+                parsed_output = self.output_parser.parse(cleaned_string)
+                print(f"\n-------\n{parsed_output}\n-------\n")
+                tool_calls = parsed_output["tool_calls"]
+                ai_message = AIMessage(content="", tool_calls=tool_calls)
+            except Exception as e:
+                ai_message = AIMessage(content=response)
         else:
-            ai_message = AIMessage(content=output_text[0])
+            ai_message = AIMessage(content=response)
 
         # Return the AIMessage wrapped in ChatGeneration and ChatResult
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
@@ -190,37 +199,17 @@ class QwenLLM(BaseChatModel):
         chain = prompt | llm
         return chain
 
+model_name = "Qwen/Qwen2.5-7B-Instruct"
 
-# Load model and processor
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2-VL-7B-Instruct", torch_dtype="auto", device_map="auto"
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype="auto",
+    device_map="auto"
 )
-processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 # Initialize the LLM and bind tools
-llm = QwenLLM(model=model, processor=processor)
-
-system_prompt = """You are the oracle, the great AI decision maker.
-Given the user's query you must decide what to do with it based on the
-list of tools provided to you.
-
-If you see that a tool has been used (in the scratchpad) with a particular
-query, do NOT use that same tool with the same query again. Also, do NOT use
-any tool more than twice (ie, if the tool appears in the scratchpad twice, do
-not use it again).
-
-You should aim to collect information from a diverse range of sources before
-providing the answer to the user. Once you have collected plenty of information
-to answer the user's question (stored in the scratchpad) use the final_answer
-tool."""
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
-    MessagesPlaceholder(variable_name="chat_history"),
-    ("user", "{input}"),
-    ("assistant", "scratchpad: {scratchpad}"),
-])
-
+llm = QwenLLM(model=model, tokenizer=tokenizer)
 
 # define a function to transform intermediate_steps from list
 # of AgentAction to scratchpad string
@@ -235,6 +224,31 @@ def create_scratchpad(intermediate_steps: list[AgentAction]):
             )
     return "\n---\n".join(agent_steps)
 
+system_prompt = """You are the Oracle, a powerful AI decision-maker.
+
+Your task is to determine the appropriate action for each user query based on the available tools.
+
+1. **Tool Usage Limitations**:
+   - If a tool has already been used with a specific query (as noted in the scratchpad), do NOT reuse that tool for the same query.
+   - No tool may be used more than twice. If a tool has appeared in the scratchpad twice, it cannot be used again.
+
+2. **Information Gathering**:
+   - Aim to gather information from a diverse array of sources before formulating your response to the user. 
+   - Store the collected information in the scratchpad.
+
+3. **Responding to Users**:
+   - The user's chat history will be provided first, followed by their current prompt. 
+   - Once you have sufficient information to answer the user's question, use the `tell_user` tool to communicate your response.
+
+Your goal is to provide the most comprehensive and informed answer possible."""
+
+oracle_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("user", "{input}"),
+    ("assistant", "scratchpad: {scratchpad}"),
+])
+
 oracle = (
     {
         "input": lambda x: x["input"],
@@ -243,15 +257,148 @@ oracle = (
             intermediate_steps=x["intermediate_steps"]
         ),
     }
-    | prompt
+    | oracle_prompt
     | llm.bind_tools(tools)
 )
 
-inputs = {
-    "input": "tell me something interesting about dogs",
-    "chat_history": [],
-    "intermediate_steps": [],
-}
+system_prompt1 = f"""You are a highly effective reflecting agent, dedicated to providing the best suggestions for the oracle.
 
-out = oracle.invoke(inputs)
-print([out])
+Your task is to analyze the user's query and the complete chat history to determine the most appropriate next steps for the oracle. Your primary goal is to assist the oracle in achieving the user's objectives efficiently.
+
+1. **Context Analysis**:
+   - The user's chat history will be provided first. Summarize the relevant parts of the chat history that pertain to the user's request.
+
+2. **Response Crafting**:
+   - Based on the latest actions taken, provide a clear and concise message that the oracle can convey to the user. 
+
+3. **Next Action Suggestion**:
+   - In this case, suggest that the oracle communicates the retrieved list of files ('AGI.py' and '.git') to the user using the `tell_user` tool. Make it explicit that this is the next action the oracle should take.
+
+4. **Tool Awareness**:
+   - Be mindful of the available tools at your disposal and mention them if they are relevant to your suggestions.
+
+List of available tools: {str([tool.name for tool in tools])}
+"""
+
+
+reflect_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt1),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("ai", "{input}"),
+    ("assistant", "scratchpad: {scratchpad}"),
+])
+
+reflect = (
+    {
+        "input": lambda x: x["input"],
+        "chat_history": lambda x: x["chat_history"],
+        "scratchpad": lambda x: create_scratchpad(
+            intermediate_steps=x["intermediate_steps"]
+        ),
+    }
+    | reflect_prompt
+    | llm
+)
+
+
+def run_oracle(state: list):
+    print("\n************\nrun_oracle")
+    print(f"input: {state['input']}")
+    print(f"chat_history: {state['chat_history']}")
+    print(f"intermediate_steps: {state['intermediate_steps']}")
+    # state_with_no_history = state.copy()
+    # state_with_no_history['chat_history'] = []
+    out = oracle.invoke(state)
+    print(f"out: {out}")
+    print(f"out.tool_calls: {out.tool_calls}")
+    if out.tool_calls:
+        tool_name = out.tool_calls[0]["name"]
+        tool_args = out.tool_calls[0]["args"]
+    else:
+        return {
+            "chat_history": [state["input"]],
+            "intermediate_steps": []
+        }  # Handle the case when no tool is suggested
+
+    action_out = AgentAction(
+        tool=tool_name,
+        tool_input=tool_args,
+        log="TBD"
+    )
+    return {
+        "chat_history": [state["input"]],
+        "intermediate_steps": [action_out]
+    }
+
+def run_reflection(state: list):
+    print("\n************\nrun_reflection")
+    state["input"] = "Given the current state, what should I do next?"
+    out = reflect.invoke(state)
+    print(f"out: {out}")
+    return {
+        "input": out.content,
+    }
+
+
+def router(state: list):
+    print("\n************\nrouter")
+    print(state)
+    if state["intermediate_steps"] == []:
+        return "oracle"
+    # return the tool name to use
+    if isinstance(state["intermediate_steps"], list):
+        return state["intermediate_steps"][-1].tool
+    else:
+        # if we output bad format go to final answer
+        print("Router invalid format")
+        return "tell_user"
+
+tool_str_to_func = {tool.name: tool for tool in tools}
+
+def run_tool(state: list):
+    # use this as helper function so we repeat less code
+    tool_name = state["intermediate_steps"][-1].tool
+    tool_args = state["intermediate_steps"][-1].tool_input
+    # run tool
+    out = tool_str_to_func[tool_name].invoke(input=tool_args)
+    print(f"\n************\n{tool_name}.invoke(input={tool_args}) -> {out}\n")
+    action_out = AgentAction(
+        tool=tool_name,
+        tool_input=tool_args,
+        log=str(out)
+    )
+    return {
+        "intermediate_steps": [action_out]
+    }
+
+graph = StateGraph(AgentState)
+
+graph.add_node("oracle", run_oracle)
+for tool_obj in tools:
+    graph.add_node(tool_obj.name, run_tool)
+graph.add_node("reflect", run_reflection)
+
+graph.set_entry_point("oracle")
+
+graph.add_conditional_edges(
+    source="oracle",  # where in graph to start
+    path=router,  # function to determine which node is called
+)
+
+# create edges from each tool back to the oracle
+for tool_obj in tools:
+    if tool_obj.name != "tell_user":
+        graph.add_edge(tool_obj.name, "reflect")
+
+graph.add_edge("reflect", "oracle")
+
+# if anything goes to final answer, it must then move to END
+graph.add_edge("tell_user", END)
+
+runnable = graph.compile()
+
+out = runnable.invoke({
+    "input": "Get list of files.",
+    "chat_history": [],
+    "intermediate_steps": []
+})
