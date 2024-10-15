@@ -39,7 +39,6 @@ from langchain_core.messages import ToolCall, ToolMessage
 
 
 device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-device = "mps"
 
 # Define tools
 @tool
