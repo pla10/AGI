@@ -1,47 +1,35 @@
 import os
 import re
 import torch
-import random
 import json
 import subprocess
 import time
-from typing import Any, List, Optional, Dict
-from typing import Annotated, Literal, TypedDict
-from typing import AsyncIterator, Iterator
+import operator
+import random
+from typing import Any, List, Optional, Dict, Union, Annotated, TypedDict
+
+from pydantic import BaseModel, Field
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from langchain_core.language_models.llms import LLM
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
-from pydantic import BaseModel, Field
 from langchain_core.output_parsers import JsonOutputParser
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AIMessageChunk, BaseMessage, ToolCall
+from langchain_core.language_models import BaseChatModel
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import run_in_executor
+from langchain_core.agents import AgentAction
 from langchain.tools import Tool
 from langchain_core.tools import tool
-from langgraph.prebuilt import ToolNode
 
-
-from langchain_core.callbacks import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun,
-)
-
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import run_in_executor
-
-from langchain_core.language_models import BaseChatModel, SimpleChatModel
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AIMessageChunk, BaseMessage
+from langgraph.graph import StateGraph, MessagesState, END, START
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph, MessagesState
 
-from typing import TypedDict, Annotated, List, Union
-from langchain_core.agents import AgentAction, AgentFinish
-import operator
+# Custom imports
+from qwen_vl_utils import process_vision_info
 
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-
-from langchain_core.messages import ToolCall, ToolMessage
-
-from transformers import AutoModelForCausalLM, AutoTokenizer
+model_name = "Qwen/Qwen2.5-14B-Instruct"
 
 try:
     print(os.environ['HF_HOME'])
@@ -73,22 +61,41 @@ def get_files_list(subdir: str) -> dict:
         return {"error": f"Error accessing directory: {str(e)}"}
 
 @tool
-def get_file_content(file: str) -> str:
+def get_file_content(filename: str) -> str:
     """Tool to get the content of a specific file specified in the argument.
     Cannot be used with directories."""
     try:
-        with open(f"/data/placido/AGI/{file}", "r") as f:
+        with open(f"/data/placido/AGI/{filename}", "r") as f:
             return f.read()
     except FileNotFoundError:
-        return f"File {file} not found."
+        return f"File {filename} not found."
     except Exception as e:
-        return f"Error reading file {file}: {str(e)}"
+        return f"Error reading file {filename}: {str(e)}"
+
+import os
+
+@tool
+def write_file(filename: str, content: str) -> str:
+    """Tool to write content to a file specified in the argument.
+    Avoids overwriting if the file already exists. Cannot be used with directories."""
+    filepath = f"/data/placido/AGI/{filename}"
+    
+    if os.path.exists(filepath):
+        return f"Error: File {filename} already exists. Writing aborted."
+    
+    try:
+        with open(filepath, "w") as f:
+            f.write(content)
+        return f"Content written to file {filename}."
+    except Exception as e:
+        return f"Error writing to file {filename}: {str(e)}"
+
 
 @tool
 def get_user_feedback(prompt: str) -> str:
     """Tool to get user feedback based on the prompt provided.
     If unsure on next steps, use this tool to get user feedback."""
-    user_input = input(prompt)
+    user_input = input(f"{prompt}\n")
 
     return user_input
 
@@ -109,6 +116,7 @@ def end_interaction() -> None:
 tools=[
     get_files_list,
     get_file_content,
+    write_file,
     get_user_feedback,
     tell_user,
     end_interaction
@@ -225,8 +233,6 @@ class QwenLLM(BaseChatModel):
 
         return llm
 
-model_name = "Qwen/Qwen2.5-7B-Instruct"
-
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype="auto",
@@ -327,7 +333,7 @@ def run_oracle(state: list):
         print("!!!!! NOT ALL REQUIRED FIELDS WERE PRESENT !!!!!")
         return run_oracle(state)
 
-    print(f"- out: {out}")
+    print(out.content)
 
     if out.tool_calls:
         tool_name = out.tool_calls[0]["name"]
@@ -352,8 +358,8 @@ def run_reflection(state: list):
     print("\n\n************************\nRUN_REFLECTION\n")
     state["input"] = "Given the current state, what should I do next?"
     out = reflect.invoke(state)
-    print(f"- out: {out.content}")
-    time.sleep(20)
+    print(out.content)
+    time.sleep(10)
     return {
         "input": out.content,
     }
@@ -406,17 +412,15 @@ graph.add_conditional_edges(
 
 # create edges from each tool back to the oracle
 for tool_obj in tools:
-    if tool_obj.name != "tell_user":
+    if tool_obj.name != "end_interaction":
         graph.add_edge(tool_obj.name, "reflect")
 
 graph.add_edge("reflect", "oracle")
-
-# if anything goes to final answer, it must then move to END
-graph.add_edge("tell_user", END)
+graph.add_edge("end_interaction", END)
 
 runnable = graph.compile()
 
-starting_prompt = "Get content of the files in the directory."
+starting_prompt = "Suggest improvements for the code in 'AGI.py' file in the current directory."
 print("\n************************")
 print(f"Starting prompt: {starting_prompt}")
 print("************************\n")
