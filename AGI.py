@@ -14,7 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from langchain_core.language_models.llms import LLM
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AIMessageChunk, BaseMessage, ToolCall
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage, ToolCall
 from langchain_core.language_models import BaseChatModel
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -32,11 +32,11 @@ from qwen_vl_utils import process_vision_info
 model_name = "Qwen/Qwen2.5-14B-Instruct"
 
 try:
-    print(os.environ['HF_HOME'])
+    print(f"Models directory: {os.environ['HF_HOME']}")
 except:
     print("HF_HOME not set")
     os.environ['HF_HOME'] = '/data/placido/cache/'
-    command = ['python3', '/data/placido/AGI/AGI.py']
+    command = ['python3', 'AGI.py']
     subprocess.check_call(command)
     exit()
 
@@ -44,11 +44,11 @@ device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
 
 # Define tools
 @tool
-def get_files_list(subdir: str) -> dict:
+def get_files_list(dir: str) -> dict:
     """Tool to list all files and directories in the directory with their types.
-    The argument 'subdir' specifies the directory to list. Default is the current directory: '.'."""
+    The argument 'dir' specifies the directory to list."""
     try:
-        files_list = os.listdir("/data/placido/AGI/"+subdir)
+        files_list = os.listdir(dir)
         result = {}
         for file_name in files_list:
             file_path = os.path.join("/data/placido/AGI/", file_name)
@@ -61,18 +61,28 @@ def get_files_list(subdir: str) -> dict:
         return {"error": f"Error accessing directory: {str(e)}"}
 
 @tool
-def get_file_content(filename: str) -> str:
+def get_file_content(file_path: str) -> str:
     """Tool to get the content of a specific file specified in the argument.
     Cannot be used with directories."""
     try:
-        with open(f"/data/placido/AGI/{filename}", "r") as f:
+        with open(file_path, "r") as f:
             return f.read()
     except FileNotFoundError:
-        return f"File {filename} not found."
+        return f"File {file_path} not found."
     except Exception as e:
-        return f"Error reading file {filename}: {str(e)}"
+        return f"Error reading file {file_path}: {str(e)}"
 
-import os
+@tool
+def run_command(command: str) -> str:
+    """Tool to run a command in the terminal and return the output."""
+    try:
+        is_it_ok = input(f"Are you sure you want to run the command: {command}? (yes/no)\n")
+        if is_it_ok.lower() != "yes":
+            return "Command not executed"
+        output = subprocess.check_output(command, shell=True, text=True)
+        return output
+    except Exception as e:
+        return f"Error running command: {str(e)}"
 
 @tool
 def write_file(filename: str, content: str) -> str:
@@ -89,7 +99,6 @@ def write_file(filename: str, content: str) -> str:
         return f"Content written to file {filename}."
     except Exception as e:
         return f"Error writing to file {filename}: {str(e)}"
-
 
 @tool
 def get_user_feedback(prompt: str) -> str:
@@ -116,6 +125,7 @@ def end_interaction() -> None:
 tools=[
     get_files_list,
     get_file_content,
+    run_command,
     write_file,
     get_user_feedback,
     tell_user,
@@ -209,9 +219,9 @@ class QwenLLM(BaseChatModel):
             content = parsed_output["content"]
             tool_calls = parsed_output["tool_calls"]
             # check if is a list
-            # print(f"°°°°°°°°°°°°°{tool_calls}")
+            print(f"°°°°°°°°°°°°°{tool_calls}")
             if not isinstance(tool_calls, list):
-                # print("°°°°°°°°°°°°°NOT A LIST")
+                print("°°°°°°°°°°°°°NOT A LIST")
                 tool_calls = [tool_calls]
             ai_message = AIMessage(content=content, tool_calls=tool_calls)
         except Exception as e:
@@ -262,7 +272,9 @@ Your task is to determine the appropriate action for each user query based on th
 
    - If a tool has already been used with a specific query (as noted in the scratchpad), do NOT reuse that tool for the same query.
    - Aim to gather information from a diverse array of sources before formulating your response to the user. 
-   - The user's chat history will be provided first, followed by their current prompt. 
+   - The user's chat history will be provided first, followed by their current prompt.
+   - If possible, prefer other tools over the 'run_command' tool.
+   - When in doubt, use the 'get_user_feedback' tool to ask the user for more information.
    - Once you have sufficient information to answer the user's question, use the `tell_user` tool to communicate your response.
 
 Your goal is to provide the most comprehensive and informed answer possible."""
@@ -292,9 +304,9 @@ system_prompt1 = f"""You are a highly effective reflecting agent, dedicated to p
 Your task is to analyze the user's query to determine the most appropriate next steps for the oracle. Your primary goal is to assist the oracle in achieving the user's objectives efficiently.
 
 - You have already received all the messages exchanged between the user and the oracle. Do not request additional information from the user.
-- The user's chat history will be provided first. Summarize the relevant parts of the chat history that pertain to the user's request.
-- Always consider the first user request as the starting point for your analysis.
-- Based on the latest actions taken, provide a clear and concise message of steps that the oracle should take next. 
+- The user's chat history will be provided first.
+- Based on the latest actions taken, provide a clear and concise message of steps that the oracle should take next.
+- Do not specify the arguments for the tools; That's the oracle's job. 
 
 List of available tools: {str([tool.name for tool in tools])}
 """
@@ -359,7 +371,7 @@ def run_reflection(state: list):
     state["input"] = "Given the current state, what should I do next?"
     out = reflect.invoke(state)
     print(out.content)
-    time.sleep(10)
+    # time.sleep(10)
     return {
         "input": out.content,
     }
@@ -387,6 +399,7 @@ def run_tool(state: list):
     # run tool
     out = tool_str_to_func[tool_name].invoke(input=tool_args)
     print(f"\n************************\n{tool_name}.invoke(input={tool_args}) -> {out}\n")
+    # print(f"\n************************\n{tool_name}.invoke(input={tool_args})\n")
     action_out = AgentAction(
         tool=tool_name,
         tool_input=tool_args,
@@ -420,7 +433,7 @@ graph.add_edge("end_interaction", END)
 
 runnable = graph.compile()
 
-starting_prompt = "Suggest improvements for the code in 'AGI.py' file in the current directory."
+starting_prompt = "Give me the tree of the content of the current directory."
 print("\n************************")
 print(f"Starting prompt: {starting_prompt}")
 print("************************\n")
