@@ -2,6 +2,9 @@ import os
 import re
 import torch
 import random
+import json
+import subprocess
+import time
 from typing import Any, List, Optional, Dict
 from typing import Annotated, Literal, TypedDict
 from typing import AsyncIterator, Iterator
@@ -26,7 +29,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_core.runnables import run_in_executor
 
 from langchain_core.language_models import BaseChatModel, SimpleChatModel
-from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AIMessageChunk, BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph, MessagesState
 
@@ -40,23 +43,39 @@ from langchain_core.messages import ToolCall, ToolMessage
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    print(os.environ['HF_HOME'])
+except:
+    print("HF_HOME not set")
+    os.environ['HF_HOME'] = '/data/placido/cache/'
+    command = ['python3', '/data/placido/AGI/AGI.py']
+    subprocess.check_call(command)
+    exit()
 
-os.environ['HF_HOME'] = '/data/placido/cache/'
 device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-
 
 # Define tools
 @tool
-def get_files_list() -> List[str]:
-    """Tool to list all files in the directory."""
+def get_files_list(subdir: str) -> dict:
+    """Tool to list all files and directories in the directory with their types.
+    The argument 'subdir' specifies the directory to list. Default is the current directory: '.'."""
     try:
-        return os.listdir("/data/placido/AGI/")
+        files_list = os.listdir("/data/placido/AGI/"+subdir)
+        result = {}
+        for file_name in files_list:
+            file_path = os.path.join("/data/placido/AGI/", file_name)
+            if os.path.isdir(file_path):
+                result[file_name] = 'directory'
+            else:
+                result[file_name] = 'file'
+        return result
     except Exception as e:
-        return [f"Error accessing directory: {str(e)}"]
+        return {"error": f"Error accessing directory: {str(e)}"}
 
 @tool
 def get_file_content(file: str) -> str:
-    """Tool to get the content of a specific file specified in the argument."""
+    """Tool to get the content of a specific file specified in the argument.
+    Cannot be used with directories."""
     try:
         with open(f"/data/placido/AGI/{file}", "r") as f:
             return f.read()
@@ -66,10 +85,19 @@ def get_file_content(file: str) -> str:
         return f"Error reading file {file}: {str(e)}"
 
 @tool
+def get_user_feedback(prompt: str) -> str:
+    """Tool to get user feedback based on the prompt provided.
+    If unsure on next steps, use this tool to get user feedback."""
+    user_input = input(prompt)
+
+    return user_input
+
+@tool
 def tell_user(
     text: str,
 ):
-    """Returns a natural language response to the user in the form of a string."""
+    """Returns a natural language response to the user in the form of a string.
+    The text argument is required and should be a string."""
     print(text)
     return text
 
@@ -81,6 +109,7 @@ def end_interaction() -> None:
 tools=[
     get_files_list,
     get_file_content,
+    get_user_feedback,
     tell_user,
     end_interaction
 ]
@@ -98,15 +127,15 @@ class AgentState(TypedDict):
 # Define a model for tool call parameters
 class ToolCall(BaseModel):
     name: str = Field(description="Name of the tool to be invoked.")
-    args: Dict[str, str] = Field(default={}, description="Parameters for the tool call. This field is required.")
+    args: Dict[str, str] = Field(description="Parameters for the tool call. If the tool does not require any parameters, an empty dictionary should be provided.")
     id: str = Field(description="Unique identifier for the tool call.")
     type: str = "tool_call"
 
 # Tool choice model with dynamic listing of available tools
 class AIAnswer(BaseModel):
-    # content: str = Field(description="Content of the message. This should specify next steps.")
+    content: str = Field(description="An explanation of why the tool was chosen. You need to provide this information to the user. REQUIRED.")
     tool_calls: ToolCall = Field(
-        description="Tool call to be invoked. Only one tool call is allowed.",
+        description="Tool call to be invoked. Only one tool call is allowed. All keys are required.",
         title="Tool Call",
         examples=[
             {
@@ -123,7 +152,7 @@ class QwenLLM(BaseChatModel):
     model: Any
     tokenizer: Any
     tools: Dict[str, callable] = {}
-    output_parser: Optional[JsonOutputParser] = None  # Add output_parser attribute
+    output_parser: JsonOutputParser = JsonOutputParser(pydantic_object=AIAnswer)
 
     def _generate(
         self,
@@ -133,12 +162,17 @@ class QwenLLM(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         """Handles LLM inference with video and text inputs."""
-        print(f"\n*******\n{messages}\n*******\n")
-
-        messages = [
-            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
-            {"role": "user", "content": messages[0].content}
-        ]
+        messages_new = []
+        for msg in messages:
+            # print(f"\n{msg.pretty_repr()}")
+            if type(msg) == SystemMessage:
+                messages_new.append({"role": "system", "content": msg.content})
+            elif type(msg) == HumanMessage:
+                messages_new.append({"role": "user", "content": msg.content})
+            elif type(msg) == AIMessage:
+                messages_new.append({"role": "assistant", "content": msg.content})
+        messages = messages_new
+        # print(f"\n######\n{messages}\n######\n")
 
         text = tokenizer.apply_chat_template(
             messages,
@@ -157,21 +191,22 @@ class QwenLLM(BaseChatModel):
 
         response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-        print(f"\n-------\n{response}\n-------\n")
-
-        # Parse the output if an output parser is set
-        if self.output_parser:
-            try:
-                #if there is the "json" string in the response, we need to remove it
-                pattern = r'^```json\s*(.*?)\s*```$'
-                cleaned_string = re.sub(pattern, r'\1', response, flags=re.DOTALL)
-                parsed_output = self.output_parser.parse(cleaned_string)
-                print(f"\n-------\n{parsed_output}\n-------\n")
-                tool_calls = parsed_output["tool_calls"]
-                ai_message = AIMessage(content="", tool_calls=tool_calls)
-            except Exception as e:
-                ai_message = AIMessage(content=response)
-        else:
+        # print(f"\n-------\n{response}\n-------\n")
+        try:
+            #if there is the "json" string in the response, we need to remove it
+            pattern = r'^```json\s*(.*?)\s*```$'
+            cleaned_string = re.sub(pattern, r'\1', response, flags=re.DOTALL)
+            parsed_output = self.output_parser.parse(cleaned_string)
+            # print(f"\n-------\n{parsed_output}\n-------\n")
+            content = parsed_output["content"]
+            tool_calls = parsed_output["tool_calls"]
+            # check if is a list
+            # print(f"°°°°°°°°°°°°°{tool_calls}")
+            if not isinstance(tool_calls, list):
+                # print("°°°°°°°°°°°°°NOT A LIST")
+                tool_calls = [tool_calls]
+            ai_message = AIMessage(content=content, tool_calls=tool_calls)
+        except Exception as e:
             ai_message = AIMessage(content=response)
 
         # Return the AIMessage wrapped in ChatGeneration and ChatResult
@@ -187,17 +222,8 @@ class QwenLLM(BaseChatModel):
         """Bind a list of tools (functions) to the LLM instance."""
         llm = self
         llm.tools = {tool.name: tool for tool in tools}
-        llm.output_parser = JsonOutputParser(pydantic_object=AIAnswer)
-        # Set up parser and prompt template
-        prompt = PromptTemplate(
-            template="{format_instructions}\n{input}",
-            input_variables=["input"],
-            partial_variables={"format_instructions": llm.output_parser.get_format_instructions()},
-        )
 
-        # Combine prompt and model into a chain
-        chain = prompt | llm
-        return chain
+        return llm
 
 model_name = "Qwen/Qwen2.5-7B-Instruct"
 
@@ -228,21 +254,15 @@ system_prompt = """You are the Oracle, a powerful AI decision-maker.
 
 Your task is to determine the appropriate action for each user query based on the available tools.
 
-1. **Tool Usage Limitations**:
    - If a tool has already been used with a specific query (as noted in the scratchpad), do NOT reuse that tool for the same query.
-   - No tool may be used more than twice. If a tool has appeared in the scratchpad twice, it cannot be used again.
-
-2. **Information Gathering**:
    - Aim to gather information from a diverse array of sources before formulating your response to the user. 
-   - Store the collected information in the scratchpad.
-
-3. **Responding to Users**:
    - The user's chat history will be provided first, followed by their current prompt. 
    - Once you have sufficient information to answer the user's question, use the `tell_user` tool to communicate your response.
 
 Your goal is to provide the most comprehensive and informed answer possible."""
 
 oracle_prompt = ChatPromptTemplate.from_messages([
+    ("system", llm.output_parser.get_format_instructions().replace("{", "{{").replace("}", "}}")),
     ("system", system_prompt),
     MessagesPlaceholder(variable_name="chat_history"),
     ("user", "{input}"),
@@ -263,19 +283,12 @@ oracle = (
 
 system_prompt1 = f"""You are a highly effective reflecting agent, dedicated to providing the best suggestions for the oracle.
 
-Your task is to analyze the user's query and the complete chat history to determine the most appropriate next steps for the oracle. Your primary goal is to assist the oracle in achieving the user's objectives efficiently.
+Your task is to analyze the user's query to determine the most appropriate next steps for the oracle. Your primary goal is to assist the oracle in achieving the user's objectives efficiently.
 
-1. **Context Analysis**:
-   - The user's chat history will be provided first. Summarize the relevant parts of the chat history that pertain to the user's request.
-
-2. **Response Crafting**:
-   - Based on the latest actions taken, provide a clear and concise message that the oracle can convey to the user. 
-
-3. **Next Action Suggestion**:
-   - In this case, suggest that the oracle communicates the retrieved list of files ('AGI.py' and '.git') to the user using the `tell_user` tool. Make it explicit that this is the next action the oracle should take.
-
-4. **Tool Awareness**:
-   - Be mindful of the available tools at your disposal and mention them if they are relevant to your suggestions.
+- You have already received all the messages exchanged between the user and the oracle. Do not request additional information from the user.
+- The user's chat history will be provided first. Summarize the relevant parts of the chat history that pertain to the user's request.
+- Always consider the first user request as the starting point for your analysis.
+- Based on the latest actions taken, provide a clear and concise message of steps that the oracle should take next. 
 
 List of available tools: {str([tool.name for tool in tools])}
 """
@@ -302,15 +315,20 @@ reflect = (
 
 
 def run_oracle(state: list):
-    print("\n************\nrun_oracle")
-    print(f"input: {state['input']}")
-    print(f"chat_history: {state['chat_history']}")
-    print(f"intermediate_steps: {state['intermediate_steps']}")
+    print("\n\n************************\nRUN_ORACLE\n")
+    # print(f"- input: {state['input']}")
+    # print(f"- chat_history: {state['chat_history']}")
+    # print(f"- intermediate_steps: {state['intermediate_steps']}")
     # state_with_no_history = state.copy()
     # state_with_no_history['chat_history'] = []
     out = oracle.invoke(state)
-    print(f"out: {out}")
-    print(f"out.tool_calls: {out.tool_calls}")
+    # check if all required fields are present, otherwise do a recursive call
+    if not all(field in out.tool_calls[0] for field in ["name", "args", "id", "type"]):
+        print("!!!!! NOT ALL REQUIRED FIELDS WERE PRESENT !!!!!")
+        return run_oracle(state)
+
+    print(f"- out: {out}")
+
     if out.tool_calls:
         tool_name = out.tool_calls[0]["name"]
         tool_args = out.tool_calls[0]["args"]
@@ -331,18 +349,19 @@ def run_oracle(state: list):
     }
 
 def run_reflection(state: list):
-    print("\n************\nrun_reflection")
+    print("\n\n************************\nRUN_REFLECTION\n")
     state["input"] = "Given the current state, what should I do next?"
     out = reflect.invoke(state)
-    print(f"out: {out}")
+    print(f"- out: {out.content}")
+    time.sleep(20)
     return {
         "input": out.content,
     }
 
 
 def router(state: list):
-    print("\n************\nrouter")
-    print(state)
+    # print("\n************************\nrouter")
+    # print(state)
     if state["intermediate_steps"] == []:
         return "oracle"
     # return the tool name to use
@@ -361,7 +380,7 @@ def run_tool(state: list):
     tool_args = state["intermediate_steps"][-1].tool_input
     # run tool
     out = tool_str_to_func[tool_name].invoke(input=tool_args)
-    print(f"\n************\n{tool_name}.invoke(input={tool_args}) -> {out}\n")
+    print(f"\n************************\n{tool_name}.invoke(input={tool_args}) -> {out}\n")
     action_out = AgentAction(
         tool=tool_name,
         tool_input=tool_args,
@@ -397,8 +416,13 @@ graph.add_edge("tell_user", END)
 
 runnable = graph.compile()
 
+starting_prompt = "Get content of the files in the directory."
+print("\n************************")
+print(f"Starting prompt: {starting_prompt}")
+print("************************\n")
+
 out = runnable.invoke({
-    "input": "Get list of files.",
+    "input": starting_prompt,
     "chat_history": [],
     "intermediate_steps": []
 })
